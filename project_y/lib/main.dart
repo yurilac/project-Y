@@ -1,32 +1,65 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:project_y/dualsense_driver.dart';
 import 'dart:async';
+
+// 引入三个设备的驱动
+import 'package:project_y/dualsense_driver.dart';
+import 'package:project_y/logitech_driver.dart';
+import 'package:project_y/dareu_driver.dart';
+
+// ==================== 通用设备数据模型 ====================
+class DeviceData {
+  final String name;
+  final int batteryLevel;
+  final bool isCharging;
+  final bool isConnected;
+  final IconData icon;
+
+  DeviceData({
+    required this.name,
+    required this.icon,
+    this.batteryLevel = 0,
+    this.isCharging = false,
+    this.isConnected = false,
+  });
+
+  DeviceData copyWith({int? batteryLevel, bool? isCharging, bool? isConnected}) {
+    return DeviceData(
+      name: name,
+      icon: icon,
+      batteryLevel: batteryLevel ?? this.batteryLevel,
+      isCharging: isCharging ?? this.isCharging,
+      isConnected: isConnected ?? this.isConnected,
+    );
+  }
+}
 
 // 全局主题控制器
 final ValueNotifier<ThemeMode> themeNotifier = ValueNotifier(ThemeMode.light);
 
-// ==================== 全局设备状态控制器 (解决状态丢失、后台与提醒逻辑) ====================
+// ==================== 全局设备状态控制器 ====================
 class DeviceMonitorController extends ChangeNotifier {
-  final _driver = DualSenseDriver();
+  final _dsDriver = DualSenseDriver();
+  final _logiDriver = LogitechDriver();
+  final _dareuDriver = DareuDriver();
+  
   Timer? _pollingTimer;
 
-  // 1. 设置状态
+  // 设置状态
   bool autoConnect = true;
   bool backgroundMonitor = false;
   bool lowBatteryAlert = true;
 
-  // 2. 设备状态
-  bool isConnected = false;
-  int batteryLevel = 0;
-  bool isCharging = false;
-  
-  bool _hasAlertedLowBattery = false;
+  // 设备列表状态
+  List<DeviceData> devices = [
+    DeviceData(name: 'PS5 DualSense', icon: Icons.gamepad),
+    DeviceData(name: '罗技 GPW 2代', icon: Icons.mouse),
+    DeviceData(name: '达尔优 EK87 PRO', icon: Icons.keyboard),
+  ];
 
-  // UI 注册的回调，用于弹出通知提醒
+  Map<String, bool> _hasAlertedLowBattery = {};
   void Function(String message)? onShowAlert;
 
-  // 更新设置开关
   void updateSettings({bool? auto, bool? background, bool? lowBattery}) {
     if (auto != null) autoConnect = auto;
     if (background != null) backgroundMonitor = background;
@@ -34,29 +67,21 @@ class DeviceMonitorController extends ChangeNotifier {
     notifyListeners();
   }
 
-  // 连接并启动监测
   Future<void> connectAndMonitor() async {
     await _fetchData();
-    if (isConnected) {
-      _startTimer();
-    } else {
-      onShowAlert?.call('未发现 DualSense 手柄，请确认蓝牙已连接。');
-    }
+    _startTimer();
   }
 
-  // 主动断开
   void disconnect() {
     _stopTimer();
-    isConnected = false;
-    batteryLevel = 0;
-    isCharging = false;
-    _hasAlertedLowBattery = false;
+    devices = devices.map((d) => d.copyWith(isConnected: false, batteryLevel: 0, isCharging: false)).toList();
+    _hasAlertedLowBattery.clear();
     notifyListeners();
   }
 
   void _startTimer() {
     _pollingTimer?.cancel();
-    // (3) 一分钟刷新一次状态
+    // 1分钟刷新一次状态
     _pollingTimer = Timer.periodic(const Duration(minutes: 1), (_) => _fetchData());
   }
 
@@ -64,45 +89,37 @@ class DeviceMonitorController extends ChangeNotifier {
     _pollingTimer?.cancel();
   }
 
-  // 核心拉取逻辑
   Future<void> _fetchData() async {
-    final result = _driver.getBatteryStatus();
-    final wasConnected = isConnected;
-    isConnected = result.isConnected;
+    // 分别拉取三个设备的状态
+    final dsStatus = _dsDriver.getBatteryStatus();
+    final logiStatus = _logiDriver.getBatteryStatus();
+    final dareuStatus = _dareuDriver.getBatteryStatus();
 
-    if (isConnected) {
-      batteryLevel = result.batteryLevel;
-      isCharging = result.isCharging;
+    devices[0] = devices[0].copyWith(isConnected: dsStatus.isConnected, batteryLevel: dsStatus.batteryLevel, isCharging: dsStatus.isCharging);
+    devices[1] = devices[1].copyWith(isConnected: logiStatus.isConnected, batteryLevel: logiStatus.batteryLevel, isCharging: logiStatus.isCharging);
+    devices[2] = devices[2].copyWith(isConnected: dareuStatus.isConnected, batteryLevel: dareuStatus.batteryLevel, isCharging: dareuStatus.isCharging);
 
-      // (2) 低电量通知提醒 (低于 20% 且没在充电时提醒一次)
-      if (lowBatteryAlert && batteryLevel <= 20 && !isCharging) {
-        if (!_hasAlertedLowBattery) {
-          _hasAlertedLowBattery = true;
-          onShowAlert?.call('⚠️ 提醒：DualSense 手柄电量极低 ($batteryLevel%)，请及时充电！');
+    // 低电量提醒逻辑
+    for (var dev in devices) {
+      if (dev.isConnected) {
+        if (lowBatteryAlert && dev.batteryLevel <= 20 && !dev.isCharging) {
+          if (!(_hasAlertedLowBattery[dev.name] ?? false)) {
+            _hasAlertedLowBattery[dev.name] = true;
+            onShowAlert?.call('⚠️ 提醒：${dev.name} 电量低 (${dev.batteryLevel}%)，请及时充电！');
+          }
+        } else {
+          _hasAlertedLowBattery[dev.name] = false;
         }
-      } else {
-        _hasAlertedLowBattery = false; // 电量恢复或处于充电状态，重置通知锁
-      }
-    } else {
-      _hasAlertedLowBattery = false;
-      if (wasConnected) {
-        onShowAlert?.call('DualSense 手柄已断开连接。');
-        _stopTimer(); // 断开后停止轮询
       }
     }
     notifyListeners();
   }
 
-  // (2) 处理应用生命周期（后台状态监测）
   void handleLifecycleChange(AppLifecycleState state) {
     if (state == AppLifecycleState.paused || state == AppLifecycleState.hidden) {
-      // 如果未开启后台监测，进入后台时暂停定时器
-      if (!backgroundMonitor) {
-        _stopTimer();
-      }
+      if (!backgroundMonitor) _stopTimer();
     } else if (state == AppLifecycleState.resumed) {
-      // 回到前台，如果处于连接状态且定时器没在跑，恢复一分钟轮询
-      if (isConnected && (_pollingTimer == null || !_pollingTimer!.isActive)) {
+      if (devices.any((d) => d.isConnected) && (_pollingTimer == null || !_pollingTimer!.isActive)) {
         _startTimer();
         _fetchData();
       }
@@ -110,7 +127,6 @@ class DeviceMonitorController extends ChangeNotifier {
   }
 }
 
-// 单例全局实例
 final globalMonitor = DeviceMonitorController();
 
 // ===================================================================================
@@ -128,16 +144,10 @@ class DeviceMonitorApp extends StatelessWidget {
       valueListenable: themeNotifier,
       builder: (_, ThemeMode currentMode, __) {
         return MaterialApp(
-          title: '跨平台演示 Demo',
+          title: '极客外设中枢',
           debugShowCheckedModeBanner: false,
-          theme: ThemeData(
-            colorScheme: ColorScheme.fromSeed(seedColor: Colors.blueAccent, brightness: Brightness.light),
-            useMaterial3: true,
-          ),
-          darkTheme: ThemeData(
-            colorScheme: ColorScheme.fromSeed(seedColor: Colors.blueAccent, brightness: Brightness.dark),
-            useMaterial3: true,
-          ),
+          theme: ThemeData(colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple, brightness: Brightness.light), useMaterial3: true),
+          darkTheme: ThemeData(colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple, brightness: Brightness.dark), useMaterial3: true),
           themeMode: currentMode,
           home: const MainNavigationScreen(),
         );
@@ -148,90 +158,59 @@ class DeviceMonitorApp extends StatelessWidget {
 
 class MainNavigationScreen extends StatefulWidget {
   const MainNavigationScreen({super.key});
-
   @override
   State<MainNavigationScreen> createState() => _MainNavigationScreenState();
 }
 
-// 混入 WidgetsBindingObserver 用于监听应用生命周期
 class _MainNavigationScreenState extends State<MainNavigationScreen> with WidgetsBindingObserver {
   int _currentIndex = 0;
-
-  final List<Widget> _pages = const [
-    MockSwitchesPage(),
-    InteractionPage(),
-  ];
+  final List<Widget> _pages = const [MockSwitchesPage(), InteractionPage()];
 
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this); // 注册生命周期监听
-    
-    // 绑定全局提醒的 UI 呈现 (SnackBar)
+    WidgetsBinding.instance.addObserver(this);
     globalMonitor.onShowAlert = (msg) {
       if (mounted) {
         ScaffoldMessenger.of(context).clearSnackBars();
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(msg),
-            behavior: SnackBarBehavior.floating,
-            backgroundColor: msg.contains('⚠️') ? Colors.redAccent : null,
-          ),
-        );
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg), behavior: SnackBarBehavior.floating, backgroundColor: msg.contains('⚠️') ? Colors.redAccent : null));
       }
     };
   }
 
   @override
   void dispose() {
-    WidgetsBinding.instance.removeObserver(this); // 移除监听
+    WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
 
   @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    // 将生命周期变化传递给控制器处理
-    globalMonitor.handleLifecycleChange(state);
-  }
+  void didChangeAppLifecycleState(AppLifecycleState state) => globalMonitor.handleLifecycleChange(state);
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('设备控制器 Demo'),
+        title: const Text('极客外设中枢'),
         centerTitle: true,
         actions: [
-          IconButton(
-            icon: Icon(themeNotifier.value == ThemeMode.light ? Icons.dark_mode : Icons.light_mode),
-            onPressed: () {
-              themeNotifier.value = themeNotifier.value == ThemeMode.light ? ThemeMode.dark : ThemeMode.light;
-            },
-            tooltip: '切换主题',
-          )
+          IconButton(icon: Icon(themeNotifier.value == ThemeMode.light ? Icons.dark_mode : Icons.light_mode), onPressed: () => themeNotifier.value = themeNotifier.value == ThemeMode.light ? ThemeMode.dark : ThemeMode.light)
         ],
       ),
-      // (1) 使用 IndexedStack 替代 AnimatedSwitcher，这样无论怎么切 Tab，内部滚动高度和局部状态都原封不动
-      body: IndexedStack(
-        index: _currentIndex,
-        children: _pages,
-      ),
+      body: IndexedStack(index: _currentIndex, children: _pages),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _currentIndex,
-        onDestinationSelected: (int index) {
-          setState(() {
-            _currentIndex = index;
-          });
-        },
+        onDestinationSelected: (int index) => setState(() => _currentIndex = index),
         destinations: const [
-          NavigationDestination(icon: Icon(Icons.toggle_on_outlined), selectedIcon: Icon(Icons.toggle_on), label: '设置与开关'),
-          NavigationDestination(icon: Icon(Icons.gamepad_outlined), selectedIcon: Icon(Icons.gamepad), label: '外设交互'),
+          NavigationDestination(icon: Icon(Icons.toggle_on_outlined), selectedIcon: Icon(Icons.toggle_on), label: '全局设置'),
+          NavigationDestination(icon: Icon(Icons.hub_outlined), selectedIcon: Icon(Icons.hub), label: '设备状态'),
         ],
       ),
     );
   }
 }
 
-// ==================== 页面1：开关演示页 (重构为 Stateless 并监听全局) ====================
+// ==================== 页面1：设置页 ====================
 class MockSwitchesPage extends StatelessWidget {
   const MockSwitchesPage({super.key});
 
@@ -243,35 +222,16 @@ class MockSwitchesPage extends StatelessWidget {
         return ListView(
           padding: const EdgeInsets.all(16.0),
           children: [
-            const Padding(
-              padding: EdgeInsets.symmetric(vertical: 8.0, horizontal: 16.0),
-              child: Text('连接首选项', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.grey)),
-            ),
             Card(
               elevation: 0,
               color: Theme.of(context).colorScheme.surfaceContainerHighest,
               child: Column(
                 children: [
-                  SwitchListTile(
-                    title: const Text('蓝牙自动连接'),
-                    subtitle: const Text('启动时自动寻找并配对已知设备'),
-                    value: globalMonitor.autoConnect,
-                    onChanged: (bool value) => globalMonitor.updateSettings(auto: value),
-                  ),
+                  SwitchListTile(title: const Text('蓝牙/2.4G 自动轮询'), subtitle: const Text('启动时自动寻找已知设备'), value: globalMonitor.autoConnect, onChanged: (v) => globalMonitor.updateSettings(auto: v)),
                   const Divider(height: 1),
-                  SwitchListTile(
-                    title: const Text('后台状态监测'),
-                    subtitle: const Text('应用最小化时持续获取信息'),
-                    value: globalMonitor.backgroundMonitor,
-                    onChanged: (bool value) => globalMonitor.updateSettings(background: value),
-                  ),
+                  SwitchListTile(title: const Text('后台状态监测'), subtitle: const Text('应用最小化时持续获取信息'), value: globalMonitor.backgroundMonitor, onChanged: (v) => globalMonitor.updateSettings(background: v)),
                   const Divider(height: 1),
-                  SwitchListTile(
-                    title: const Text('低电量通知提醒'),
-                    subtitle: const Text('当设备电量低于 20% 时弹出系统通知'),
-                    value: globalMonitor.lowBatteryAlert,
-                    onChanged: (bool value) => globalMonitor.updateSettings(lowBattery: value),
-                  ),
+                  SwitchListTile(title: const Text('低电量通知提醒'), subtitle: const Text('设备低于 20% 弹出提醒'), value: globalMonitor.lowBatteryAlert, onChanged: (v) => globalMonitor.updateSettings(lowBattery: v)),
                 ],
               ),
             ),
@@ -282,7 +242,7 @@ class MockSwitchesPage extends StatelessWidget {
   }
 }
 
-// ==================== 页面2：交互演示页 (重构为 Stateless 并监听全局) ====================
+// ==================== 页面2：设备监测列表页 ====================
 class InteractionPage extends StatelessWidget {
   const InteractionPage({super.key});
 
@@ -297,100 +257,72 @@ class InteractionPage extends StatelessWidget {
     return AnimatedBuilder(
       animation: globalMonitor,
       builder: (context, child) {
-        final isConnected = globalMonitor.isConnected;
-        final batteryLevel = globalMonitor.batteryLevel;
-        final isCharging = globalMonitor.isCharging;
+        final isAnyConnected = globalMonitor.devices.any((d) => d.isConnected);
 
-        return Padding(
-          padding: const EdgeInsets.all(24.0),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              // 状态卡片
-              Container(
-                padding: const EdgeInsets.symmetric(vertical: 40, horizontal: 24),
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    colors: isConnected
-                        ? [Theme.of(context).colorScheme.primary, Theme.of(context).colorScheme.secondary]
-                        : [Colors.grey.shade700, Colors.grey.shade800],
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                  ),
-                  borderRadius: BorderRadius.circular(24),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withOpacity(0.2),
-                      blurRadius: 10,
-                      offset: const Offset(0, 5),
-                    )
-                  ],
-                ),
-                child: Column(
-                  children: [
-                    if (!isConnected) ...[
-                      const Icon(Icons.gamepad, size: 64, color: Colors.white54),
-                      const SizedBox(height: 16),
-                      const Text('DualSense 5 未连接', style: TextStyle(fontSize: 18, color: Colors.white)),
-                    ] else ...[
-                      // 环形电量指示器
-                      SizedBox(
-                        width: 120,
-                        height: 120,
-                        child: Stack(
-                          fit: StackFit.expand,
-                          children: [
-                            CircularProgressIndicator(
-                              value: batteryLevel / 100,
-                              strokeWidth: 12,
-                              backgroundColor: Colors.white.withOpacity(0.2),
-                              valueColor: AlwaysStoppedAnimation<Color>(_getBatteryColor(batteryLevel)),
-                              strokeCap: StrokeCap.round,
+        return Column(
+          children: [
+            Expanded(
+              child: ListView.builder(
+                padding: const EdgeInsets.all(16.0),
+                itemCount: globalMonitor.devices.length,
+                itemBuilder: (context, index) {
+                  final dev = globalMonitor.devices[index];
+                  return Card(
+                    margin: const EdgeInsets.only(bottom: 16),
+                    elevation: 4,
+                    shadowColor: Colors.black26,
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                    child: Padding(
+                      padding: const EdgeInsets.all(20.0),
+                      child: Row(
+                        children: [
+                          Icon(dev.icon, size: 48, color: dev.isConnected ? Theme.of(context).colorScheme.primary : Colors.grey),
+                          const SizedBox(width: 20),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(dev.name, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                                const SizedBox(height: 4),
+                                Text(dev.isConnected ? '已连接' : '未发现设备', style: TextStyle(color: dev.isConnected ? Colors.green : Colors.grey)),
+                              ],
                             ),
-                            Center(
-                              child: Column(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Icon(
-                                    isCharging ? Icons.bolt : Icons.battery_std,
-                                    color: Colors.white,
-                                    size: 28,
-                                  ),
-                                  Text(
-                                    '$batteryLevel%',
-                                    style: const TextStyle(
-                                      fontSize: 24,
-                                      fontWeight: FontWeight.bold,
-                                      color: Colors.white,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ],
-                        ),
+                          ),
+                          if (dev.isConnected)
+                            Column(
+                              children: [
+                                Stack(
+                                  alignment: Alignment.center,
+                                  children: [
+                                    CircularProgressIndicator(value: dev.batteryLevel / 100, backgroundColor: Colors.grey.shade300, valueColor: AlwaysStoppedAnimation<Color>(_getBatteryColor(dev.batteryLevel))),
+                                    Icon(dev.isCharging ? Icons.bolt : Icons.battery_std, size: 16, color: _getBatteryColor(dev.batteryLevel)),
+                                  ],
+                                ),
+                                const SizedBox(height: 8),
+                                Text('${dev.batteryLevel}%', style: const TextStyle(fontWeight: FontWeight.bold)),
+                              ],
+                            )
+                        ],
                       ),
-                      const SizedBox(height: 24),
-                      const Text('DualSense 5 已连接 (Bluetooth)', 
-                        style: TextStyle(fontSize: 16, color: Colors.white, fontWeight: FontWeight.w500)),
-                    ],
-                  ],
-                ),
+                    ),
+                  );
+                },
               ),
-              const SizedBox(height: 40),
-
-              // 操作按钮
-              FilledButton.icon(
-                onPressed: isConnected ? globalMonitor.disconnect : globalMonitor.connectAndMonitor,
-                icon: Icon(isConnected ? Icons.bluetooth_disabled : Icons.bluetooth_connected),
-                label: Text(isConnected ? '断开设备监测' : '连接并读取电量'),
+            ),
+            Padding(
+              padding: const EdgeInsets.all(24.0),
+              child: FilledButton.icon(
+                onPressed: isAnyConnected ? globalMonitor.disconnect : globalMonitor.connectAndMonitor,
+                icon: Icon(isAnyConnected ? Icons.stop_circle : Icons.play_arrow),
+                label: Text(isAnyConnected ? '停止所有监测' : '一键扫描设备电量'),
                 style: FilledButton.styleFrom(
+                  minimumSize: const Size(double.infinity, 60),
                   padding: const EdgeInsets.symmetric(vertical: 20),
-                  backgroundColor: isConnected ? Colors.red.shade400 : null,
+                  backgroundColor: isAnyConnected ? Colors.red.shade400 : null,
                 ),
               ),
-            ],
-          ),
+            ),
+          ],
         );
       }
     );
