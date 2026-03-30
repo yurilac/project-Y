@@ -144,7 +144,7 @@ class DeviceMonitorApp extends StatelessWidget {
       valueListenable: themeNotifier,
       builder: (_, ThemeMode currentMode, __) {
         return MaterialApp(
-          title: '极客外设中枢',
+          title: '外设电量',
           debugShowCheckedModeBanner: false,
           theme: ThemeData(colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple, brightness: Brightness.light), useMaterial3: true),
           darkTheme: ThemeData(colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple, brightness: Brightness.dark), useMaterial3: true),
@@ -191,7 +191,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> with Widget
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('极客外设中枢'),
+        title: const Text('外设电量'),
         centerTitle: true,
         actions: [
           IconButton(icon: Icon(themeNotifier.value == ThemeMode.light ? Icons.dark_mode : Icons.light_mode), onPressed: () => themeNotifier.value = themeNotifier.value == ThemeMode.light ? ThemeMode.dark : ThemeMode.light)

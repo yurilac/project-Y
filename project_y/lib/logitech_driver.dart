@@ -1,11 +1,12 @@
 import 'dart:ffi';
+import 'dart:io';
 import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
 import 'package:win32/win32.dart';
-import 'package:flutter/material.dart'; // 修复 Undefined name 'Icons'
-import 'package:project_y/main.dart'; // 引入 DeviceData 模型
+import 'package:flutter/material.dart';
+import 'package:project_y/main.dart'; // 确保 DeviceData 定义在这里面
 
-// 修复 HIDD_ATTRIBUTES 报错：沿用你原有的自定义结构体
+// 结构体映射
 final class CustomHidAttributes extends Struct {
   @Uint32()
   external int Size;
@@ -24,7 +25,6 @@ typedef _HidD_GetHidGuid_C = Void Function(Pointer<GUID> guid);
 typedef _HidD_GetHidGuid_Dart = void Function(Pointer<GUID> guid);
 final _HidD_GetHidGuid = _hidLib.lookupFunction<_HidD_GetHidGuid_C, _HidD_GetHidGuid_Dart>('HidD_GetHidGuid');
 
-// 使用 CustomHidAttributes 替换原先的报错定义
 typedef _HidD_GetAttributes_C = Bool Function(IntPtr deviceHandle, Pointer<CustomHidAttributes> attributes);
 typedef _HidD_GetAttributes_Dart = bool Function(int deviceHandle, Pointer<CustomHidAttributes> attributes);
 final _HidD_GetAttributes = _hidLib.lookupFunction<_HidD_GetAttributes_C, _HidD_GetAttributes_Dart>('HidD_GetAttributes');
@@ -66,38 +66,99 @@ class LogitechDriver {
 
               if (_HidD_GetAttributes(hDevice, attributes) && attributes.ref.VendorID == logitechVid) {
                 
-                // --- 罗技 HID++ 2.0 协议查询 ---
-                final buffer = arena<Uint8>(20);
-                final bytesWritten = arena<Uint32>();
-                final bytesRead = arena<Uint32>();
-                
-                buffer[0] = 0x11; // HID++ Long Message
-                buffer[1] = 0x01; // Device Index (无线设备通常挂在 0x01)
-                buffer[2] = 0x08; // Feature Index (0x08 是罗技常见的 Battery 获取 Feature ID)
-                buffer[3] = 0x00; // Function ID 0 (Get Level)
-                
-                if (_WriteFile(hDevice, buffer, 20, bytesWritten, nullptr) != 0) {
-                  final readBuffer = arena<Uint8>(20);
+                // --- 核心方法：向根节点查询动态频道的真实索引 ---
+                int getFeatureIndex(int featureIdHigh, int featureIdLow) {
+                  final buf = arena<Uint8>(20);
+                  final list = buf.asTypedList(20);
+                  list.fillRange(0, 20, 0);
                   
-                  // 马上读取返回的数据包
-                  if (ReadFile(hDevice, readBuffer, 20, bytesRead, nullptr) != 0) {
-                     final data = readBuffer.asTypedList(20);
-                     
-                     // 验证是否是我们的回复报文 (ReportID=0x11, DeviceIndex=0x01)
-                     if (data[0] == 0x11 && data[1] == 0x01) {
-                        int battery = data[4]; // 字节 4 是百分比
-                        int status = data[5];  // 字节 5 是充电状态
+                  list[0] = 0x11; // Long Message
+                  list[1] = 0x01; // Device Index
+                  list[2] = 0x00; // Root Feature
+                  list[3] = 0x00; // Function 0: GetFeature
+                  list[4] = featureIdHigh;
+                  list[5] = featureIdLow;
+                  
+                  final bytesWritten = arena<Uint32>();
+                  if (_WriteFile(hDevice, buf, 20, bytesWritten, nullptr) != 0) {
+                    // 读取多次，防止恰好读取到鼠标移动坐标的数据包 (坐标包是 0x01 / 0x02 开头)
+                    for (int i = 0; i < 20; i++) {
+                      final readBuf = arena<Uint8>(20);
+                      final bytesRead = arena<Uint32>();
+                      if (ReadFile(hDevice, readBuf, 20, bytesRead, nullptr) != 0) {
+                        final readList = readBuf.asTypedList(20);
+                        if (readList[0] == 0x11 && readList[1] == 0x01 && readList[2] == 0x00 && readList[3] == 0x00) {
+                          return readList[4]; // 成功拿到频道索引
+                        }
+                      }
+                    }
+                  }
+                  return 0;
+                }
+
+                // ==============================================
+                // 第一步：获取电池管理频道的准确位址
+                // ==============================================
+                int featureIndex = 0;
+                bool isUnifiedBattery = true;
+
+                // 优先查询 GPW2 的 0x1004 频道
+                featureIndex = getFeatureIndex(0x10, 0x04);
+                if (featureIndex == 0) {
+                  // 回退查询老款使用的 0x1000 频道
+                  featureIndex = getFeatureIndex(0x10, 0x00);
+                  isUnifiedBattery = false;
+                }
+
+                // ==============================================
+                // 第二步：索要真实电量（修复了 Function ID 的大坑）
+                // ==============================================
+                if (featureIndex != 0) {
+                  final buf = arena<Uint8>(20);
+                  final list = buf.asTypedList(20);
+                  list.fillRange(0, 20, 0);
+
+                  // 决定查询状态的函数ID：
+                  // 0x1004 的查状态是 Function 1 (位运算: 0x10)
+                  // 0x1000 的查状态是 Function 0 (位运算: 0x00)
+                  int functionId = isUnifiedBattery ? 1 : 0;
+
+                  list[0] = 0x11; 
+                  list[1] = 0x01; 
+                  list[2] = featureIndex; 
+                  list[3] = functionId << 4; // 发送查电量的核心！
+                  
+                  final bytesWritten = arena<Uint32>();
+                  if (_WriteFile(hDevice, buf, 20, bytesWritten, nullptr) != 0) {
+                    for (int i = 0; i < 20; i++) {
+                      final readBuf = arena<Uint8>(20);
+                      final bytesRead = arena<Uint32>();
+                      if (ReadFile(hDevice, readBuf, 20, bytesRead, nullptr) != 0) {
+                        final readList = readBuf.asTypedList(20);
                         
-                        CloseHandle(hDevice);
-                        SetupDiDestroyDeviceInfoList(hDevInfo);
-                        return DeviceData(
-                          name: '罗技 GPW 2代',
-                          icon: Icons.mouse,
-                          batteryLevel: battery.clamp(0, 100),
-                          isCharging: status == 1 || status == 2,
-                          isConnected: true,
-                        );
-                     }
+                        // 确认回复是我们刚才调用的 Function
+                        if (readList[0] == 0x11 && 
+                            readList[1] == 0x01 && 
+                            readList[2] == featureIndex && 
+                            (readList[3] & 0xF0) == (functionId << 4)) {
+                          
+                          int battery = readList[4]; // 真·电量
+                          int status = readList[6];  // 对于 0x1000 和 0x1004，状态都在索引 6
+                          
+                          bool isCharging = (status == 1 || status == 2 || status == 3 || status == 4);
+
+                          CloseHandle(hDevice);
+                          SetupDiDestroyDeviceInfoList(hDevInfo);
+                          return DeviceData(
+                            name: '罗技 GPW 2代',
+                            icon: Icons.mouse,
+                            batteryLevel: battery.clamp(0, 100),
+                            isCharging: isCharging,
+                            isConnected: true,
+                          );
+                        }
+                      }
+                    }
                   }
                 }
               }

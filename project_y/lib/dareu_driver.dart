@@ -1,4 +1,5 @@
 import 'dart:ffi';
+import 'dart:io';
 import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
 import 'package:win32/win32.dart';
@@ -36,9 +37,20 @@ typedef _HidD_GetFeature_C = Bool Function(IntPtr hidDeviceObject, Pointer<Void>
 typedef _HidD_GetFeature_Dart = bool Function(int hidDeviceObject, Pointer<Void> reportBuffer, int reportBufferLength);
 final _HidD_GetFeature = _hidLib.lookupFunction<_HidD_GetFeature_C, _HidD_GetFeature_Dart>('HidD_GetFeature');
 
+// 定义达尔优设备配置（同时支持 2.4G 和 有线模式）
+class DareuConfig {
+  final int vid;
+  final int pid;
+  final int targetId; // 核心：无线接收器需要 0x10 来路由到键盘
+
+  const DareuConfig(this.vid, this.pid, this.targetId);
+}
+
 class DareuDriver {
-  static const int dareuVid = 0x258A;
-  static const int dareuPid = 0x0060;
+  static const List<DareuConfig> supportedDevices = [
+    DareuConfig(0x260D, 0x0037, 0x10), // 2.4G 接收器 (将命令路由给通道1的设备)
+    DareuConfig(0x258A, 0x0060, 0x00), // 有线直连模式
+  ];
 
   DeviceData getBatteryStatus() {
     return using((Arena arena) {
@@ -63,43 +75,73 @@ class DareuDriver {
           if (SetupDiGetDeviceInterfaceDetail(hDevInfo, deviceInterfaceData, rawBuffer.cast(), detailSize.value, nullptr, nullptr) != 0) {
             final pathPtr = rawBuffer.elementAt(4).cast<Utf16>();
 
+            // Windows 机制：系统级键盘接口会返回 Access Denied，代码会自动继续循环，
+            // 直到碰到厂商自定义接口(Vendor Defined)才会拿到有效的可读写 hDevice
             final hDevice = CreateFile(pathPtr, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, 0);
 
             if (hDevice != INVALID_HANDLE_VALUE) {
               final attributes = arena<CustomHidAttributes>();
               attributes.ref.Size = sizeOf<CustomHidAttributes>();
 
-              if (_HidD_GetAttributes(hDevice, attributes) && attributes.ref.VendorID == dareuVid && attributes.ref.ProductID == dareuPid) {
+              if (_HidD_GetAttributes(hDevice, attributes)) {
                 
-                // --- 达尔优 (合盈方案) 私有协议抓包还原 ---
-                final featureBuffer = arena<Uint8>(65);
-                
-                // 构建查询请求包 
-                featureBuffer[0] = 0x00; // Report ID 
-                featureBuffer[1] = 0x00; // TargetId
-                featureBuffer[2] = 0x04; // Size
-                featureBuffer[3] = 0x07; // CLASS_POWER
-                featureBuffer[4] = 0x80; // CMD_BAT_STATUS | GET_CMD
-                
-                // 发送 Feature Report
-                if (_HidD_SetFeature(hDevice, featureBuffer.cast(), 65)) {
-                  // 读取返回的 Feature Report
-                  if (_HidD_GetFeature(hDevice, featureBuffer.cast(), 65)) {
-                    final data = featureBuffer.asTypedList(65);
+                // 【核心修改 1】：匹配设备是否在已知列表内
+                DareuConfig? currentConfig;
+                for (var cfg in supportedDevices) {
+                  if (attributes.ref.VendorID == cfg.vid && attributes.ref.ProductID == cfg.pid) {
+                    currentConfig = cfg;
+                    break;
+                  }
+                }
+
+                if (currentConfig != null) {
+                  final featureBuffer = arena<Uint8>(65);
+                  final dataList = featureBuffer.asTypedList(65);
+                  
+                  dataList.fillRange(0, 65, 0);
+                  
+                  // 【核心修改 2】：依照 TgHidDevice 构建私有协议数据包
+                  dataList[0] = 0x00; // Report ID 
+                  dataList[1] = currentConfig.targetId; // TargetId (发送给接收器必须要填 0x10)
+                  dataList[2] = 0x03; // HDR_SIZE (固定尺寸 0x03)
+                  dataList[3] = 0x07; // HDR_CLASS (CLASS_POWER)
+                  dataList[4] = 0x80; // HDR_COMMAND (PWR_CMD_BAT_STATUS | GET_CMD)
+                  dataList[5] = 0x00; // HDR_PROFILE
+                  
+                  // 下发查询指令
+                  if (_HidD_SetFeature(hDevice, featureBuffer.cast(), 65)) {
                     
-                    int status = data[7]; // 状态
-                    int battery = data[8]; // 电量百分比
-                    
-                    CloseHandle(hDevice);
-                    SetupDiDestroyDeviceInfoList(hDevInfo);
-                    
-                    return DeviceData(
-                      name: '达尔优 EK87 PRO',
-                      icon: Icons.keyboard,
-                      batteryLevel: battery.clamp(0, 100),
-                      isCharging: status == 0x01 || status == 0x02,
-                      isConnected: true,
-                    );
+                    // 无线模式由于需要接收器跟键盘空中通讯，一定要加入延时轮询
+                    for (int retry = 0; retry < 20; retry++) {
+                      sleep(const Duration(milliseconds: 15)); // 等待空中包返回
+                      
+                      dataList.fillRange(0, 65, 0);
+                      dataList[0] = 0x00;
+                      
+                      if (_HidD_GetFeature(hDevice, featureBuffer.cast(), 65)) {
+                        
+                        // 校验是否属于有效应答 (低 4 位等于 0x02)
+                        int hdrStatus = dataList[1];
+                        if ((hdrStatus & 0x0F) == 0x02) {
+                          
+                          // 取出电量：索引偏移自 JS 中的 PAYLOAD_BASE (即 0x06) + 1
+                          // 在包含 Report ID[0] 的 Dart 数组里，就是 7 和 8 
+                          int status = dataList[7];
+                          int battery = dataList[8];
+                          
+                          CloseHandle(hDevice);
+                          SetupDiDestroyDeviceInfoList(hDevInfo);
+                          
+                          return DeviceData(
+                            name: '达尔优 EK87 PRO',
+                            icon: Icons.keyboard,
+                            batteryLevel: battery.clamp(0, 100),
+                            isCharging: status == 0x01 || status == 0x02,
+                            isConnected: true,
+                          );
+                        }
+                      }
+                    }
                   }
                 }
               }
