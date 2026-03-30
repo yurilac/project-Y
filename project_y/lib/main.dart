@@ -6,6 +6,8 @@ import 'dart:async';
 import 'package:project_y/dualsense_driver.dart';
 import 'package:project_y/logitech_driver.dart';
 import 'package:project_y/dareu_driver.dart';
+import 'package:project_y/inzone_h5_driver.dart';
+
 
 // ==================== 通用设备数据模型 ====================
 class DeviceData {
@@ -42,9 +44,9 @@ class DeviceMonitorController extends ChangeNotifier {
   final _dsDriver = DualSenseDriver();
   final _logiDriver = LogitechDriver();
   final _dareuDriver = DareuDriver();
-  
-  Timer? _pollingTimer;
+  final _inzoneH5Driver = InzoneH5Driver();
 
+  Timer? _pollingTimer;
   // 设置状态
   bool autoConnect = true;
   bool backgroundMonitor = false;
@@ -55,9 +57,10 @@ class DeviceMonitorController extends ChangeNotifier {
     DeviceData(name: 'PS5 DualSense', icon: Icons.gamepad),
     DeviceData(name: '罗技 GPW 2代', icon: Icons.mouse),
     DeviceData(name: '达尔优 EK87 PRO', icon: Icons.keyboard),
+    DeviceData(name: 'Inzone H5', icon: Icons.headphones),
   ];
 
-  Map<String, bool> _hasAlertedLowBattery = {};
+  final Map<String, bool> _hasAlertedLowBattery = {};
   void Function(String message)? onShowAlert;
 
   void updateSettings({bool? auto, bool? background, bool? lowBattery}) {
@@ -94,10 +97,12 @@ class DeviceMonitorController extends ChangeNotifier {
     final dsStatus = _dsDriver.getBatteryStatus();
     final logiStatus = _logiDriver.getBatteryStatus();
     final dareuStatus = _dareuDriver.getBatteryStatus();
+    final inzoneH5Status = _inzoneH5Driver.getBatteryStatus();
 
     devices[0] = devices[0].copyWith(isConnected: dsStatus.isConnected, batteryLevel: dsStatus.batteryLevel, isCharging: dsStatus.isCharging);
     devices[1] = devices[1].copyWith(isConnected: logiStatus.isConnected, batteryLevel: logiStatus.batteryLevel, isCharging: logiStatus.isCharging);
     devices[2] = devices[2].copyWith(isConnected: dareuStatus.isConnected, batteryLevel: dareuStatus.batteryLevel, isCharging: dareuStatus.isCharging);
+    devices[3] = devices[3].copyWith(isConnected: inzoneH5Status.isConnected, batteryLevel: inzoneH5Status.batteryLevel, isCharging: inzoneH5Status.isCharging);
 
     // 低电量提醒逻辑
     for (var dev in devices) {
@@ -142,7 +147,7 @@ class DeviceMonitorApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return ValueListenableBuilder<ThemeMode>(
       valueListenable: themeNotifier,
-      builder: (_, ThemeMode currentMode, __) {
+      builder: (_, ThemeMode currentMode, _) {
         return MaterialApp(
           title: '外设电量',
           debugShowCheckedModeBanner: false,
