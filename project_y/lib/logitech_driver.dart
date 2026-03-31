@@ -103,6 +103,9 @@ final _CancelIoEx =
 
 class LogitechDriver {
   static const int logitechVid = 0x046D;
+  static const int _hidppUnifiedBatteryFeatureHigh = 0x10;
+  static const int _hidppUnifiedBatteryFeatureLow = 0x04;
+  static const int _hidppUnifiedBatteryStatusFunction = 0x10;
 
   // 先尝试 0x11（Long），失败回退 0x10（USB 场景兼容）
   int _preferredReportId = 0x11;
@@ -114,7 +117,6 @@ class LogitechDriver {
 
   // 缓存：减少每次都根查询 feature
   int? _cachedFeatureIndex;
-  bool _cachedIsUnifiedBattery = true;
   DateTime? _cacheTime;
   static const Duration _cacheTtl = Duration(seconds: 30);
 
@@ -279,7 +281,6 @@ class LogitechDriver {
     int hDevice,
     int reportId,
     int featureIndex,
-    bool isUnifiedBattery,
     DateTime deadline,
     void Function(int battery, bool isCharging) onSuccess,
   ) {
@@ -289,12 +290,12 @@ class LogitechDriver {
     final list = buf.asTypedList(20);
     list.fillRange(0, 20, 0);
 
-    final int functionId = isUnifiedBattery ? 1 : 0;
+    const int functionCode = _hidppUnifiedBatteryStatusFunction;
 
     list[0] = reportId;
     list[1] = 0x01;
     list[2] = featureIndex;
-    list[3] = functionId << 4;
+    list[3] = functionCode;
 
     final writeOk = _writeFileWithTimeout(arena, hDevice, buf, 20, _ioTimeout);
     if (!writeOk) return false;
@@ -313,7 +314,7 @@ class LogitechDriver {
 
       if (readList[1] == 0x01 &&
           readList[2] == featureIndex &&
-          (readList[3] & 0xF0) == (functionId << 4)) {
+          (readList[3] & 0xF0) == functionCode) {
         final int battery = readList[4].clamp(0, 100);
         final int status = readList[6];
         final bool isCharging =
@@ -419,7 +420,6 @@ class LogitechDriver {
             hDevice,
             _preferredReportId,
             _cachedFeatureIndex!,
-            _cachedIsUnifiedBattery,
             deadline,
             (int battery, bool isCharging) {
               result = DeviceData(
@@ -439,7 +439,6 @@ class LogitechDriver {
               hDevice,
               fallback,
               _cachedFeatureIndex!,
-              _cachedIsUnifiedBattery,
               deadline,
               (int battery, bool isCharging) {
                 result = DeviceData(
@@ -461,18 +460,16 @@ class LogitechDriver {
           }
         }
 
-        int featureIndex = 0;
-        bool isUnifiedBattery = true;
-
-        featureIndex = _getFeatureIndex(arena, hDevice, 0x10, 0x04, deadline);
-        if (featureIndex == 0 && !_isExpired(deadline)) {
-          featureIndex = _getFeatureIndex(arena, hDevice, 0x10, 0x00, deadline);
-          isUnifiedBattery = false;
-        }
-
+        final int featureIndex =
+            _getFeatureIndex(
+              arena,
+              hDevice,
+              _hidppUnifiedBatteryFeatureHigh,
+              _hidppUnifiedBatteryFeatureLow,
+              deadline,
+            );
         if (featureIndex != 0 && !_isExpired(deadline)) {
           _cachedFeatureIndex = featureIndex;
-          _cachedIsUnifiedBattery = isUnifiedBattery;
           _cacheTime = DateTime.now();
 
           bool ok = _readBatteryWithReportId(
@@ -480,7 +477,6 @@ class LogitechDriver {
             hDevice,
             _preferredReportId,
             featureIndex,
-            isUnifiedBattery,
             deadline,
             (int battery, bool isCharging) {
               result = DeviceData(
@@ -500,7 +496,6 @@ class LogitechDriver {
               hDevice,
               fallback,
               featureIndex,
-              isUnifiedBattery,
               deadline,
               (int battery, bool isCharging) {
                 result = DeviceData(

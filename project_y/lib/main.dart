@@ -819,8 +819,17 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> with Widget
       await windowManager.focus();
     };
     desktopService.onExitApp = () async {
+      if (_isExiting) return;
       _isExiting = true;
-      await windowManager.destroy();
+      try {
+        globalMonitor.disconnect();
+      } catch (e) {
+        debugPrint('disconnect on exit failed: $e');
+      }
+      if (Platform.isWindows) {
+        await windowManager.setPreventClose(false);
+      }
+      exit(0);
     };
   }
 
