@@ -256,6 +256,7 @@ class DeviceMonitorController extends ChangeNotifier {
   final _inzoneH5Driver = InzoneH5Driver();
 
   Timer? _pollingTimer;
+  Timer? _startupRetryTimer;
 
   bool launchAtStartup = false;
   bool backgroundMonitor = true;
@@ -282,9 +283,20 @@ class DeviceMonitorController extends ChangeNotifier {
   Future<void> connectAndMonitor() async {
     await _fetchData();
     _startTimer();
+    // If some devices were not found on the initial scan, schedule a retry after
+    // a short delay. This handles the case where the Windows HID subsystem has
+    // not yet fully initialized when the app auto-starts at boot.
+    if (devices.any((d) => !d.isConnected)) {
+      _startupRetryTimer = Timer(const Duration(seconds: 5), () async {
+        if (_pollingTimer != null && _pollingTimer!.isActive) {
+          await _fetchData();
+        }
+      });
+    }
   }
 
   void disconnect() {
+    _startupRetryTimer?.cancel();
     _stopTimer();
     devices = devices
         .map((d) => d.copyWith(isConnected: false, batteryLevel: 0, isCharging: false))
@@ -353,10 +365,13 @@ class DeviceMonitorController extends ChangeNotifier {
     if (state == AppLifecycleState.paused || state == AppLifecycleState.hidden) {
       if (!backgroundMonitor) _stopTimer();
     } else if (state == AppLifecycleState.resumed) {
-      if (devices.any((d) => d.isConnected) && (_pollingTimer == null || !_pollingTimer!.isActive)) {
+      if (_pollingTimer == null || !_pollingTimer!.isActive) {
         _startTimer();
-        _fetchData();
       }
+      // Always fetch immediately on resume so the UI shows current device
+      // status as soon as the window is visible, rather than waiting up to
+      // one minute for the next periodic timer tick.
+      _fetchData();
     }
   }
 }
