@@ -123,15 +123,6 @@ class InzoneH5Driver {
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
   ];
 
-  // 模板B（你之前图里也出现 0x21 0x09 ... 0x85）
-  static const List<int> _requestB = [
-    0x02, 0x0c, 0x01, 0x00, 0xfc, 0x08, 0x96, 0xc3,
-    0x21, 0x09, 0x01, 0x01, 0x00, 0x85,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  ];
-
   // 是否开启日志
   static const bool _verboseLog = true;
 
@@ -150,32 +141,26 @@ class InzoneH5Driver {
       final ctrl = handles.ctrlHandle;
       final input = handles.inHandle ?? handles.ctrlHandle!;
 
-      // 先尝试模板A，再尝试模板B
-      final templates = <List<int>>[_requestA, _requestB];
-      for (int t = 0; t < templates.length; t++) {
-        final req = templates[t];
-        _log('Try request template ${t + 1}');
+      _log('Try request template A');
 
-        if (ctrl != null) {
-          final writeOk = _writeRequest(ctrl, req);
-          _log('write template ${t + 1}: $writeOk');
-        } else {
-          _log('ctrl handle is null, skip write');
-        }
+      if (ctrl != null) {
+        final writeOk = _writeRequest(ctrl, _requestA);
+        _log('write template A: $writeOk');
+      } else {
+        _log('ctrl handle is null, skip write');
+      }
 
-        final result = _readBatteryWithTimeout(input, timeoutMs: 1800);
-        if (result != null) {
-          _closeHandles(handles);
-          _log('Battery success: ${result.batteryLevel}%, charging=${result.isCharging}');
-          return result;
-        }
-
-        _log('Template ${t + 1} no battery packet');
+      final result = _readBatteryWithTimeout(input, timeoutMs: 500);
+      if (result != null) {
+        _closeHandles(handles);
+        _log('Battery success: ${result.batteryLevel}%, charging=${result.isCharging}');
+        return result;
       }
 
       _closeHandles(handles);
+      _log('Template A no battery packet');
       _log('Connected but no battery packet captured');
-      return InzoneH5Data(isConnected: true);
+      return InzoneH5Data(isConnected: false, isCharging: false, batteryLevel: 0);
     });
   }
 
@@ -222,7 +207,6 @@ class InzoneH5Driver {
       final path = pathPtr.toDartString();
       _log('Interface path: $path');
 
-      // 关键：读我们要用 OVERLAPPED 避免阻塞，写也允许同句柄使用
       final hDevice = CreateFile(
         pathPtr,
         GENERIC_READ | GENERIC_WRITE,
@@ -273,9 +257,6 @@ class InzoneH5Driver {
         'usage=0x${caps.ref.Usage.toRadixString(16)}',
       );
 
-      // 选择策略：
-      // - ctrl: OutputReportByteLength >= 64 的第一个
-      // - in: InputReportByteLength >= 64 且与 ctrl 不同的第一个
       if (ctrlHandle == null && caps.ref.OutputReportByteLength >= 64) {
         ctrlHandle = hDevice;
         _log('select ctrlHandle=${_h(ctrlHandle)}');
@@ -301,6 +282,11 @@ class InzoneH5Driver {
 
   bool _writeRequest(int handle, List<int> request64) {
     return using((arena) {
+      if (!_isUsableHandle(handle)) {
+        _log('write skip: invalid handle ${_h(handle)}');
+        return false;
+      }
+
       final writeBuf = arena<Uint8>(64);
       for (int i = 0; i < 64; i++) {
         writeBuf[i] = request64[i];
@@ -308,7 +294,7 @@ class InzoneH5Driver {
 
       final ov = arena<OVERLAPPED>();
       ov.ref.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
-      if (ov.ref.hEvent == NULL) {
+      if (ov.ref.hEvent == NULL || ov.ref.hEvent == INVALID_HANDLE_VALUE) {
         _log('CreateEvent(write) failed err=${GetLastError()}');
         return false;
       }
@@ -322,20 +308,28 @@ class InzoneH5Driver {
             final wait = WaitForSingleObject(ov.ref.hEvent, 150);
             if (wait != WAIT_OBJECT_0) {
               _log('Write timeout/abnormal wait=$wait err=${GetLastError()}');
-              CancelIo(handle);
+              CancelIo(handle); // best-effort
               return false;
             }
             if (GetOverlappedResult(handle, ov, bytesWritten, FALSE) == 0) {
-              _log('GetOverlappedResult(write) failed err=${GetLastError()}');
+              final e = GetLastError();
+              _log('GetOverlappedResult(write) failed err=$e');
               return false;
             }
+          } else if (_isDeviceGoneError(err)) {
+            _log('WriteFile device unavailable err=$err');
+            return false;
           } else {
             _log('WriteFile failed err=$err');
             return false;
           }
         } else {
-          // 可能同步完成
-          GetOverlappedResult(handle, ov, bytesWritten, FALSE);
+          if (GetOverlappedResult(handle, ov, bytesWritten, FALSE) == 0) {
+            final e = GetLastError();
+            if (!_isDeviceGoneError(e)) {
+              _log('GetOverlappedResult(write sync) failed err=$e');
+            }
+          }
         }
 
         _log('TX(${bytesWritten.value}): ${_hex(Uint8List.fromList(request64))}');
@@ -350,12 +344,17 @@ class InzoneH5Driver {
 
   InzoneH5Data? _readBatteryWithTimeout(int inputHandle, {int timeoutMs = 1800}) {
     return using((arena) {
+      if (!_isUsableHandle(inputHandle)) {
+        _log('read skip: invalid handle ${_h(inputHandle)}');
+        return null;
+      }
+
       final readBuf = arena<Uint8>(64);
       final bytesRead = arena<Uint32>();
 
       final ov = arena<OVERLAPPED>();
       ov.ref.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
-      if (ov.ref.hEvent == NULL) {
+      if (ov.ref.hEvent == NULL || ov.ref.hEvent == INVALID_HANDLE_VALUE) {
         _log('CreateEvent(read) failed err=${GetLastError()}');
         return null;
       }
@@ -378,24 +377,38 @@ class InzoneH5Driver {
               if (wait == WAIT_OBJECT_0) {
                 final ok = GetOverlappedResult(inputHandle, ov, bytesRead, FALSE);
                 if (ok == 0) {
-                  _log('GetOverlappedResult(read) failed err=${GetLastError()}');
+                  final e = GetLastError();
+                  if (_isDeviceGoneError(e)) {
+                    _log('read device unavailable err=$e');
+                    return null;
+                  }
+                  _log('GetOverlappedResult(read) failed err=$e');
                   continue;
                 }
               } else if (wait == WAIT_TIMEOUT) {
-                CancelIo(inputHandle);
-                _log('read timeout loop=$loops');
+                CancelIo(inputHandle); // best-effort
                 continue;
               } else {
                 _log('WaitForSingleObject(read) abnormal=$wait err=${GetLastError()}');
                 break;
               }
+            } else if (_isDeviceGoneError(err)) {
+              _log('ReadFile device unavailable err=$err');
+              return null;
             } else {
               _log('ReadFile immediate fail err=$err');
               break;
             }
           } else {
-            // 同步完成
-            GetOverlappedResult(inputHandle, ov, bytesRead, FALSE);
+            if (GetOverlappedResult(inputHandle, ov, bytesRead, FALSE) == 0) {
+              final e = GetLastError();
+              if (_isDeviceGoneError(e)) {
+                _log('read sync device unavailable err=$e');
+                return null;
+              }
+              _log('GetOverlappedResult(read sync) failed err=$e');
+              continue;
+            }
           }
 
           if (bytesRead.value == 0) {
@@ -429,17 +442,29 @@ class InzoneH5Driver {
   // ===================== 资源释放 =====================
 
   void _closeHandles(_InzoneHandles handles) {
-    if (handles.ctrlHandle != null && handles.ctrlHandle != INVALID_HANDLE_VALUE) {
+    if (_isUsableHandle(handles.ctrlHandle)) {
       CloseHandle(handles.ctrlHandle!);
     }
-    if (handles.inHandle != null &&
-        handles.inHandle != INVALID_HANDLE_VALUE &&
-        handles.inHandle != handles.ctrlHandle) {
+    if (_isUsableHandle(handles.inHandle) && handles.inHandle != handles.ctrlHandle) {
       CloseHandle(handles.inHandle!);
     }
   }
 
-  // ===================== 日志工具 =====================
+  // ===================== 错误与日志工具 =====================
+
+  static bool _isUsableHandle(int? h) {
+    return h != null && h != NULL && h != INVALID_HANDLE_VALUE;
+  }
+
+  // 耳机关机/链路断开时常见错误码（Windows HID/USB）
+  static bool _isDeviceGoneError(int err) {
+    return err == ERROR_DEVICE_NOT_CONNECTED || // 1167
+        err == ERROR_GEN_FAILURE || // 31
+        err == ERROR_OPERATION_ABORTED || // 995
+        err == ERROR_INVALID_HANDLE || // 6
+        err == ERROR_NOT_READY || // 21
+        err == ERROR_NO_SUCH_DEVICE; // 433
+  }
 
   static String _h(int? h) => h == null ? 'null' : '0x${h.toRadixString(16)}';
 
