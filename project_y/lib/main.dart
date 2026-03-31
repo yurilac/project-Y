@@ -5,9 +5,11 @@ import 'dart:ui';
 
 import 'package:flutter/material.dart';
 import 'package:local_notifier/local_notifier.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 import 'package:system_tray/system_tray.dart';
 import 'package:window_manager/window_manager.dart';
+
+// 新增：INI 配置服务
+import 'package:project_y/config_service.dart';
 
 // 引入四个设备的驱动
 import 'package:project_y/dareu_driver.dart';
@@ -95,42 +97,95 @@ String _themeModeLabel(ThemeMode mode) {
   }
 }
 
-Future<void> _loadThemeSettings() async {
-  final prefs = await SharedPreferences.getInstance();
-  final themeModeRaw = prefs.getString('theme_mode') ?? 'system';
-  final seedRaw = prefs.getString('theme_seed') ?? 'oceanBlue';
-
-  themeNotifier.value = switch (themeModeRaw) {
-    'light' => ThemeMode.light,
-    'dark' => ThemeMode.dark,
-    _ => ThemeMode.system,
-  };
-
-  seedNotifier.value = switch (seedRaw) {
-    'sakuraPink' => AppThemeSeed.sakuraPink,
-    'grassGreen' => AppThemeSeed.grassGreen,
-    'vitalityYellow' => AppThemeSeed.vitalityYellow,
-    'mikuGreen' => AppThemeSeed.mikuGreen,
-    _ => AppThemeSeed.oceanBlue,
-  };
+String _themeModeToRaw(ThemeMode mode) {
+  switch (mode) {
+    case ThemeMode.light:
+      return 'light';
+    case ThemeMode.dark:
+      return 'dark';
+    case ThemeMode.system:
+      return 'system';
+  }
 }
 
-Future<void> _saveThemeSettings() async {
-  final prefs = await SharedPreferences.getInstance();
-  final mode = switch (themeNotifier.value) {
-    ThemeMode.light => 'light',
-    ThemeMode.dark => 'dark',
-    ThemeMode.system => 'system',
-  };
-  final seed = switch (seedNotifier.value) {
-    AppThemeSeed.sakuraPink => 'sakuraPink',
-    AppThemeSeed.grassGreen => 'grassGreen',
-    AppThemeSeed.oceanBlue => 'oceanBlue',
-    AppThemeSeed.vitalityYellow => 'vitalityYellow',
-    AppThemeSeed.mikuGreen => 'mikuGreen',
-  };
-  await prefs.setString('theme_mode', mode);
-  await prefs.setString('theme_seed', seed);
+String _seedToRaw(AppThemeSeed seed) {
+  switch (seed) {
+    case AppThemeSeed.sakuraPink:
+      return 'sakuraPink';
+    case AppThemeSeed.grassGreen:
+      return 'grassGreen';
+    case AppThemeSeed.oceanBlue:
+      return 'oceanBlue';
+    case AppThemeSeed.vitalityYellow:
+      return 'vitalityYellow';
+    case AppThemeSeed.mikuGreen:
+      return 'mikuGreen';
+  }
+}
+
+ThemeMode _rawToThemeMode(String raw) {
+  switch (raw) {
+    case 'light':
+      return ThemeMode.light;
+    case 'dark':
+      return ThemeMode.dark;
+    default:
+      return ThemeMode.system;
+  }
+}
+
+AppThemeSeed _rawToSeed(String raw) {
+  switch (raw) {
+    case 'sakuraPink':
+      return AppThemeSeed.sakuraPink;
+    case 'grassGreen':
+      return AppThemeSeed.grassGreen;
+    case 'vitalityYellow':
+      return AppThemeSeed.vitalityYellow;
+    case 'mikuGreen':
+      return AppThemeSeed.mikuGreen;
+    default:
+      return AppThemeSeed.oceanBlue;
+  }
+}
+
+Future<void> _saveAllToIni() async {
+  final data = AppConfigData(
+    themeMode: _themeModeToRaw(themeNotifier.value),
+    themeSeed: _seedToRaw(seedNotifier.value),
+    launchAtStartup: globalMonitor.launchAtStartup,
+    backgroundMonitor: globalMonitor.backgroundMonitor,
+    lowBatteryAlert: globalMonitor.lowBatteryAlert,
+  );
+  await ConfigService.save(data);
+}
+
+// ==================== Windows 开机自启服务 ====================
+class WindowsStartupService {
+  static const String _appName = 'ProjectYDeviceMonitor';
+
+  static Future<bool> setLaunchAtStartup(bool enabled) async {
+    if (!Platform.isWindows) return false;
+    final exePath = Platform.resolvedExecutable;
+    final quoted = '"$exePath"';
+
+    final args = enabled
+        ? ['add', r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run', '/v', _appName, '/t', 'REG_SZ', '/d', quoted, '/f']
+        : ['delete', r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run', '/v', _appName, '/f'];
+
+    final result = await Process.run('reg', args, runInShell: true);
+    return result.exitCode == 0;
+  }
+
+  static Future<bool> isLaunchAtStartupEnabled() async {
+    if (!Platform.isWindows) return false;
+    final result = await Process.run(
+      'reg',
+      ['query', r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run', '/v', _appName],
+      runInShell: true,
+    );
+    return result.exitCode == 0;
+  }
 }
 
 // ==================== 托盘 + 通知 ====================
@@ -202,7 +257,7 @@ class DeviceMonitorController extends ChangeNotifier {
 
   Timer? _pollingTimer;
 
-  bool autoConnect = true;
+  bool launchAtStartup = false;
   bool backgroundMonitor = true;
   bool lowBatteryAlert = true;
 
@@ -216,11 +271,12 @@ class DeviceMonitorController extends ChangeNotifier {
   final Map<String, bool> _hasAlertedLowBattery = {};
   void Function(String message)? onShowAlert;
 
-  void updateSettings({bool? auto, bool? background, bool? lowBattery}) {
-    if (auto != null) autoConnect = auto;
+  Future<void> updateSettings({bool? startup, bool? background, bool? lowBattery}) async {
+    if (startup != null) launchAtStartup = startup;
     if (background != null) backgroundMonitor = background;
     if (lowBattery != null) lowBatteryAlert = lowBattery;
     notifyListeners();
+    await _saveAllToIni(); // INI 持久化
   }
 
   Future<void> connectAndMonitor() async {
@@ -359,8 +415,7 @@ class GlassCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // 浅色主题透明度加倍（0.46 -> 0.23）
-    final tint = isDark ? const Color.fromARGB(255, 255, 255, 255).withOpacity(0.07) : const Color.fromARGB(255, 255, 255, 255).withOpacity(0.8);
+    final tint = isDark ? Colors.white.withOpacity(0.07) : Colors.white.withOpacity(0.23);
     final border = isDark ? Colors.white24 : Colors.black12;
 
     return ClipRRect(
@@ -511,7 +566,28 @@ class GlassBottomBar extends StatelessWidget {
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await _loadThemeSettings();
+
+  // 初始化 INI
+  await ConfigService.init();
+  final ini = await ConfigService.load();
+
+  // 应用主题设置（来自 INI）
+  themeNotifier.value = _rawToThemeMode(ini.themeMode);
+  seedNotifier.value = _rawToSeed(ini.themeSeed);
+
+  // 应用全局设置（来自 INI）
+  globalMonitor.launchAtStartup = ini.launchAtStartup;
+  globalMonitor.backgroundMonitor = ini.backgroundMonitor;
+  globalMonitor.lowBatteryAlert = ini.lowBatteryAlert;
+
+  // 启动即自动监测
+  unawaited(globalMonitor.connectAndMonitor());
+
+  // 校准开机启动开关（Windows）
+  if (Platform.isWindows) {
+    globalMonitor.launchAtStartup = await WindowsStartupService.isLaunchAtStartupEnabled();
+    await _saveAllToIni(); // 写回 ini 保持一致
+  }
 
   if (Platform.isWindows) {
     await windowManager.ensureInitialized();
@@ -638,14 +714,14 @@ class DeviceMonitorApp extends StatelessWidget {
   }
 }
 
+// ==================== 主页面 ====================
 class MainNavigationScreen extends StatefulWidget {
   const MainNavigationScreen({super.key});
   @override
   State<MainNavigationScreen> createState() => _MainNavigationScreenState();
 }
 
-class _MainNavigationScreenState extends State<MainNavigationScreen>
-    with WidgetsBindingObserver, WindowListener {
+class _MainNavigationScreenState extends State<MainNavigationScreen> with WidgetsBindingObserver, WindowListener {
   int _currentIndex = 0;
   bool _isExiting = false;
   final List<Widget> _pages = const [InteractionPage(), MockSwitchesPage()];
@@ -734,8 +810,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen>
   }
 
   @override
-  void didChangeAppLifecycleState(AppLifecycleState state) =>
-      globalMonitor.handleLifecycleChange(state);
+  void didChangeAppLifecycleState(AppLifecycleState state) => globalMonitor.handleLifecycleChange(state);
 
   @override
   void onWindowClose() async {
@@ -802,12 +877,11 @@ class _MainNavigationScreenState extends State<MainNavigationScreen>
                           textAlign: TextAlign.center,
                           style: const TextStyle(
                             fontSize: 20,
-                            fontWeight: FontWeight.w700, // 默认加粗
+                            fontWeight: FontWeight.w700,
                           ),
                           decoration: InputDecoration(
                             isDense: true,
-                            contentPadding:
-                                const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                            contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
                             filled: true,
                             fillColor: isDark
                                 ? Colors.white.withOpacity(0.10)
@@ -842,7 +916,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen>
                           _appTitle,
                           style: const TextStyle(
                             fontSize: 20,
-                            fontWeight: FontWeight.w700, // 默认加粗
+                            fontWeight: FontWeight.w700,
                           ),
                         ),
                       ),
@@ -916,7 +990,7 @@ class _ThemeSettingSheet extends StatelessWidget {
                   selected: mode == m,
                   onSelected: (_) async {
                     themeNotifier.value = m;
-                    await _saveThemeSettings();
+                    await _saveAllToIni();
                   },
                 );
               }).toList(),
@@ -940,7 +1014,7 @@ class _ThemeSettingSheet extends StatelessWidget {
                   avatar: CircleAvatar(backgroundColor: _seedToColor(s), radius: 8),
                   onSelected: (_) async {
                     seedNotifier.value = s;
-                    await _saveThemeSettings();
+                    await _saveAllToIni();
                   },
                 );
               }).toList(),
@@ -1021,10 +1095,30 @@ class MockSwitchesPage extends StatelessWidget {
               child: Column(
                 children: [
                   buildTile(
-                    value: globalMonitor.autoConnect,
-                    title: '蓝牙/2.4G 自动轮询',
-                    subtitle: '启动时自动寻找已知设备',
-                    onChanged: (v) => globalMonitor.updateSettings(auto: v),
+                    value: globalMonitor.launchAtStartup,
+                    title: '开机启动',
+                    subtitle: '开机自动启动应用并开始监测',
+                    onChanged: (v) async {
+                      await globalMonitor.updateSettings(startup: v);
+
+                      final ok = await WindowsStartupService.setLaunchAtStartup(v);
+                      if (!ok && context.mounted) {
+                        await globalMonitor.updateSettings(startup: !v);
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                            content: Text('设置开机启动失败，请检查权限后重试'),
+                            behavior: SnackBarBehavior.floating,
+                          ),
+                        );
+                      } else if (ok && context.mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(
+                            content: Text(v ? '已开启开机启动' : '已关闭开机启动'),
+                            behavior: SnackBarBehavior.floating,
+                          ),
+                        );
+                      }
+                    },
                   ),
                   Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 2),
@@ -1034,7 +1128,7 @@ class MockSwitchesPage extends StatelessWidget {
                     value: globalMonitor.backgroundMonitor,
                     title: '后台状态监测',
                     subtitle: '应用最小化时持续获取信息（Windows托盘）',
-                    onChanged: (v) => globalMonitor.updateSettings(background: v),
+                    onChanged: (v) async => globalMonitor.updateSettings(background: v),
                   ),
                   Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 2),
@@ -1044,7 +1138,7 @@ class MockSwitchesPage extends StatelessWidget {
                     value: globalMonitor.lowBatteryAlert,
                     title: '低电量通知提醒',
                     subtitle: '设备低于 20% 发送提醒',
-                    onChanged: (v) => globalMonitor.updateSettings(lowBattery: v),
+                    onChanged: (v) async => globalMonitor.updateSettings(lowBattery: v),
                   ),
                 ],
               ),
